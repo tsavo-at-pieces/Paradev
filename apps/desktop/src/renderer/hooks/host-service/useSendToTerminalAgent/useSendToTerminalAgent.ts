@@ -2,9 +2,10 @@ import { useLingui } from "@lingui/react/macro";
 import { errorMessage } from "@superset/i18n/errors";
 import { sanitizePromptForPty } from "@superset/shared/agent-prompt-launch";
 import { toast } from "@superset/ui/sonner";
-import { workspaceTrpc } from "@superset/workspace-client";
+import { useWorkspaceClient, workspaceTrpc } from "@superset/workspace-client";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
+import { electronTrpc } from "renderer/lib/electron-trpc";
 import { getTerminalAgentBindingsQueryKey } from "../useTerminalAgentBindings/useTerminalAgentBindings";
 
 export type AgentPromptFileSide = "additions" | "deletions" | "mixed";
@@ -74,6 +75,8 @@ export function useSendToTerminalAgent(): UseSendToTerminalAgentResult {
 	const { t } = useLingui();
 	const queryClient = useQueryClient();
 	const sendToTerminal = workspaceTrpc.terminal.send.useMutation();
+	const sendWithReceipt = electronTrpc.submissionProvenance.send.useMutation();
+	const { hostUrl } = useWorkspaceClient();
 
 	const send = useCallback(
 		async ({
@@ -83,12 +86,17 @@ export function useSendToTerminalAgent(): UseSendToTerminalAgentResult {
 			submit,
 		}: SendToTerminalAgentInput) => {
 			try {
-				await sendToTerminal.mutateAsync({
+				const message = {
 					workspaceId,
 					terminalId,
 					text: sanitizePromptForPty(text).trimEnd(),
 					submit,
+				};
+				const submission = await sendWithReceipt.mutateAsync({
+					hostUrl,
+					...message,
 				});
+				if (!submission.handled) await sendToTerminal.mutateAsync(message);
 			} catch (error) {
 				// The likeliest failure is a target whose pty died (daemon crash,
 				// reboot) while its session row lagged behind — refetch the
@@ -111,8 +119,11 @@ export function useSendToTerminalAgent(): UseSendToTerminalAgentResult {
 				throw error;
 			}
 		},
-		[sendToTerminal, t, queryClient],
+		[sendToTerminal, sendWithReceipt, hostUrl, t, queryClient],
 	);
 
-	return { send, isPending: sendToTerminal.isPending };
+	return {
+		send,
+		isPending: sendToTerminal.isPending || sendWithReceipt.isPending,
+	};
 }

@@ -32,6 +32,7 @@ import {
 	scanForTerminalTitle,
 	type TerminalTitleScanState,
 } from "@superset/shared/terminal-title-scanner";
+import type { SubmissionAssertion } from "@superset/shared/transcript-receipts";
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import type { Hono } from "hono";
 import { getSupervisor } from "../daemon/index.ts";
@@ -44,6 +45,7 @@ import {
 	getPathState,
 	inaccessiblePathMessage,
 } from "../runtime/path-state/index.ts";
+import { prepareSubmissionDelivery } from "../submission-provenance/index.ts";
 import { issueAttributionToken } from "../terminal-agents/attribution-token.ts";
 import { sweepAgentBindingsAfterDaemonLoss } from "../terminal-agents/daemon-loss-sweep.ts";
 import { terminalHarnessSession } from "../terminal-agents/harness-session-ref.ts";
@@ -80,6 +82,11 @@ import {
 	recordShellReadyMarkerEvidence,
 } from "./shell-ready-evidence.ts";
 import { TerminalColorAuthority } from "./TerminalColorAuthority";
+import {
+	beginTerminalInputProvenance,
+	invalidateInputProvenance,
+	releaseTerminalInputProvenance,
+} from "./terminal-input-provenance.ts";
 import {
 	createModeTracker,
 	type ModeTracker,
@@ -611,6 +618,8 @@ interface TerminalSession {
 	 */
 	dsrCarry: Uint8Array;
 	initialCommandQueued: boolean;
+	initialCommandWritten?: Promise<boolean>;
+	initialCommandRequiresAcknowledgement?: boolean;
 	/**
 	 * Basename of the launch shell. Picks the source keyword when a long
 	 * initialCommand is staged as a script (fish 4 removed `.`; sh/ksh
@@ -750,6 +759,7 @@ onDaemonDisconnect((err) => {
 		listAliveSessionIds: listDaemonAliveSessionIds,
 	});
 	for (const session of sessions.values()) {
+		releaseTerminalInputProvenance(session.terminalId);
 		cancelShellReady(session);
 		for (const socket of session.sockets) {
 			try {
@@ -786,6 +796,7 @@ onDaemonDisconnect((err) => {
  */
 export function __resetSessionsForTesting(): void {
 	for (const session of sessions.values()) {
+		releaseTerminalInputProvenance(session.terminalId);
 		cancelShellReady(session);
 		if (session.unsubscribeDaemon) {
 			try {
@@ -1061,6 +1072,7 @@ export function writeInputToSession({
 	}
 
 	if (session.readOnly) return externalReadOnlyError();
+	invalidateInputProvenance(terminalId);
 	session.pty.write(data);
 	return { success: true };
 }
@@ -1096,6 +1108,7 @@ async function waitForSessionReplay(
 	} catch (error) {
 		if (sessions.get(session.terminalId) === session) {
 			sessions.delete(session.terminalId);
+			releaseTerminalInputProvenance(session.terminalId);
 			cancelShellReady(session);
 			try {
 				session.unsubscribeDaemon?.();
@@ -1176,6 +1189,9 @@ async function getOrAdoptSession({
 }
 
 interface SessionMessageInput {
+	prepareSubmission?: typeof prepareSubmissionDelivery;
+	enterDelayMs?: number;
+	submissionAssertion?: SubmissionAssertion;
 	terminalId: string;
 	workspaceId: string;
 	text: string;
@@ -1253,6 +1269,9 @@ async function writeSessionMessage(
 		signal,
 		db,
 		eventBus,
+		submissionAssertion,
+		enterDelayMs = FOLLOW_UP_ENTER_DELAY_MS,
+		prepareSubmission = prepareSubmissionDelivery,
 	}: SessionMessageInput,
 	agent?: AgentMessageTarget,
 ): Promise<{ success: true } | TerminalSessionError> {
@@ -1295,12 +1314,39 @@ async function writeSessionMessage(
 				};
 			}
 			const message = agent ? sanitizePromptForPty(text) : text;
+			let delivery: Awaited<ReturnType<typeof prepareSubmissionDelivery>> =
+				null;
+			if (submissionAssertion && agent && submit && message.length > 0) {
+				try {
+					delivery = await prepareSubmission({
+						kind: "follow-up",
+						assertion: submissionAssertion,
+						workspaceId,
+						terminalId,
+						prompt: message,
+						nativeSessionId: agent.binding.agentSessionId,
+						provider: agent.binding.agentId,
+						transcriptPath:
+							terminalHarnessSession(db, terminalId)?.ref.reportedPath ??
+							undefined,
+					});
+				} catch {}
+			}
+			if (session.exited || !targetIsCurrent()) {
+				void delivery?.failed?.().catch(() => {});
+				return {
+					kind: "SESSION_NOT_ACTIVE",
+					error: "Terminal input target is no longer current",
+				};
+			}
 			const framed =
 				agent || session.modeTracker.isBracketedPasteActive()
 					? `\x1b[200~${message}\x1b[201~`
 					: message;
-			const write = (data: string) =>
-				agent ? session.pty.writeOrThrow(data) : session.pty.write(data);
+			const write = (data: string) => {
+				if (!delivery) invalidateInputProvenance(terminalId);
+				return agent ? session.pty.writeOrThrow(data) : session.pty.write(data);
+			};
 			let inputStaged: true | undefined;
 			try {
 				if (!submit) {
@@ -1311,8 +1357,10 @@ async function writeSessionMessage(
 				if (text.length > 0) {
 					inputStaged = true;
 					write(framed);
-					await new Promise((r) => setTimeout(r, FOLLOW_UP_ENTER_DELAY_MS));
+					await new Promise((r) => setTimeout(r, enterDelayMs));
 					if (session.exited) {
+						invalidateInputProvenance(terminalId);
+						void delivery?.failed?.().catch(() => {});
 						return {
 							kind: "SESSION_EXITED",
 							error: "Terminal session has exited",
@@ -1321,6 +1369,8 @@ async function writeSessionMessage(
 					}
 				}
 				if (!targetIsCurrent()) {
+					if (inputStaged) invalidateInputProvenance(terminalId);
+					void delivery?.failed?.().catch(() => {});
 					return {
 						kind: "SESSION_NOT_ACTIVE",
 						error: "Terminal input target is no longer current",
@@ -1328,8 +1378,11 @@ async function writeSessionMessage(
 					};
 				}
 				write("\r");
+				void delivery?.written().catch(() => {});
 				return { success: true };
 			} catch (error) {
+				if (inputStaged) invalidateInputProvenance(terminalId);
+				void delivery?.failed?.().catch(() => {});
 				return {
 					kind: "SESSION_NOT_ACTIVE",
 					error:
@@ -2378,7 +2431,11 @@ function waitForOutputQuiescence(
  */
 function tryTypeToPty(session: TerminalSession, data: string): boolean {
 	try {
-		session.pty.write(data);
+		if (session.initialCommandRequiresAcknowledgement) {
+			session.pty.writeOrThrow(data);
+		} else {
+			session.pty.write(data);
+		}
 		return true;
 	} catch {
 		return false;
@@ -2403,9 +2460,9 @@ async function typeInitialCommandVerifyingEcho(
 	session: TerminalSession,
 	typedText: string,
 	probe: string,
-	dropStagedFiles: () => void,
+	dropStagedFiles: () => false,
 	isDefunct: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
 	for (let attempt = 0; attempt <= GRACE_ECHO_MAX_RETYPES; attempt++) {
 		if (isDefunct()) return dropStagedFiles();
 		if (attempt > 0 && !tryTypeToPty(session, "\x15")) {
@@ -2416,7 +2473,7 @@ async function typeInitialCommandVerifyingEcho(
 	}
 	await new Promise((r) => setTimeout(r, INITIAL_COMMAND_ENTER_DELAY_MS));
 	if (isDefunct()) return dropStagedFiles();
-	if (!tryTypeToPty(session, "\r")) dropStagedFiles();
+	return tryTypeToPty(session, "\r") || dropStagedFiles();
 }
 
 /**
@@ -2448,9 +2505,9 @@ async function typeInitialCommandUngated(
 	session: TerminalSession,
 	typedText: string,
 	probe: string | null,
-	dropStagedFiles: () => void,
+	dropStagedFiles: () => false,
 	isDefunct: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
 	const expectedRemainder = probe
 		? Buffer.from(typedText, "utf8").toString("latin1").slice(probe.length)
 		: "";
@@ -2481,13 +2538,12 @@ async function typeInitialCommandUngated(
 		);
 		if (verified) {
 			if (isDefunct()) return dropStagedFiles();
-			if (!tryTypeToPty(session, "\r")) dropStagedFiles();
-			return;
+			return tryTypeToPty(session, "\r") || dropStagedFiles();
 		}
 	}
 	await new Promise((r) => setTimeout(r, INITIAL_COMMAND_ENTER_DELAY_MS));
 	if (isDefunct()) return dropStagedFiles();
-	if (!tryTypeToPty(session, "\r")) dropStagedFiles();
+	return tryTypeToPty(session, "\r") || dropStagedFiles();
 }
 
 /**
@@ -2545,9 +2601,12 @@ const FISH_PROMPT_STAGE_FAILED_NOTICE = new TextEncoder().encode(
 function queueInitialCommand(
 	session: TerminalSession,
 	initialCommand: string,
+	requireAcknowledgement = false,
 ): void {
 	if (session.initialCommandQueued || session.exited) return;
 	session.initialCommandQueued = true;
+	if (!requireAcknowledgement) invalidateInputProvenance(session.terminalId);
+	session.initialCommandRequiresAcknowledgement = requireAcknowledgement;
 	const commandText = initialCommand.replace(/[\r\n]+$/, "");
 	// Marker-backed shells can run interactive startup hooks that read or flush
 	// PTY input before the first prompt (direnv/devenv is one example). Wait for
@@ -2562,15 +2621,16 @@ function queueInitialCommand(
 		session.exited ||
 		session.shellReadyState === "cancelled" ||
 		sessions.get(session.terminalId) !== session;
-	void session.shellReadyPromise.then(() => {
-		if (isDefunct()) return;
+	session.initialCommandWritten = session.shellReadyPromise.then(async () => {
+		if (isDefunct()) return false;
 		const stagedPaths: string[] = [];
 		// Enter never sent — a staged script/prompt file won't run or be
 		// consumed, so it can't self-delete.
-		const dropStagedFiles = () => {
+		const dropStagedFiles = (): false => {
 			for (const staged of stagedPaths) {
 				void rm(staged, { force: true }).catch(() => {});
 			}
+			return false;
 		};
 		// fish can't parse the heredoc prompt transport — swap it for the
 		// staged-file equivalent before any typing decisions are made. When
@@ -2583,7 +2643,7 @@ function queueInitialCommand(
 				const fishStaged = stageFishPromptTransport(session, parsedTransport);
 				if (!fishStaged) {
 					deliverOutput(session, FISH_PROMPT_STAGE_FAILED_NOTICE);
-					return;
+					return false;
 				}
 				effectiveCommand = fishStaged.commandText;
 				stagedPaths.push(fishStaged.promptPath);
@@ -2613,14 +2673,13 @@ function queueInitialCommand(
 		) {
 			const probe = commandEchoProbe(typedText);
 			if (probe) {
-				void typeInitialCommandVerifyingEcho(
+				return typeInitialCommandVerifyingEcho(
 					session,
 					typedText,
 					probe,
 					dropStagedFiles,
 					isDefunct,
 				);
-				return;
 			}
 		}
 		// No marker was ever expected for this launch (unwrapped bash, sh/ksh,
@@ -2628,14 +2687,13 @@ function queueInitialCommand(
 		// whatever the startup is doing to stdin. A null probe only skips the
 		// echo verification — the quiescence wait still applies.
 		if (session.shellReadyState === "unsupported") {
-			void typeInitialCommandUngated(
+			return typeInitialCommandUngated(
 				session,
 				typedText,
 				commandEchoProbe(typedText),
 				dropStagedFiles,
 				isDefunct,
 			);
-			return;
 		}
 		// The OSC 133;A marker fires from precmd, which runs BEFORE the line
 		// editor starts reading input. Plugin init in that gap (vi-mode,
@@ -2645,15 +2703,12 @@ function queueInitialCommand(
 		// write — and as `\r`, what a real Enter key sends, bound to accept-line
 		// in every keymap — so it lands after the init storm. One Enter total,
 		// so a double-run is impossible.
-		if (!tryTypeToPty(session, typedText)) {
-			dropStagedFiles();
-			return;
-		}
-		setTimeout(() => {
-			if (isDefunct() || !tryTypeToPty(session, "\r")) {
-				dropStagedFiles();
-			}
-		}, INITIAL_COMMAND_ENTER_DELAY_MS);
+		if (!tryTypeToPty(session, typedText)) return dropStagedFiles();
+		await new Promise((resolve) =>
+			setTimeout(resolve, INITIAL_COMMAND_ENTER_DELAY_MS),
+		);
+		if (isDefunct()) return dropStagedFiles();
+		return tryTypeToPty(session, "\r") || dropStagedFiles();
 	});
 }
 
@@ -2813,6 +2868,7 @@ async function disposeSessionUnlocked(
 			// best-effort
 		}
 		sessions.delete(terminalId);
+		releaseTerminalInputProvenance(terminalId);
 	} else {
 		closePromise = closeDaemonSessionById(terminalId, "SIGHUP");
 	}
@@ -2929,6 +2985,7 @@ export async function disposeSessionsByWorktreePath(
 }
 
 interface CreateTerminalSessionOptions {
+	acknowledgeInitialCommand?: boolean;
 	externalObservation?: boolean;
 	externalAgentConfigId?: string;
 	terminalId: string;
@@ -3119,6 +3176,7 @@ async function createTerminalSessionUnlocked({
 	db,
 	eventBus,
 	initialCommand,
+	acknowledgeInitialCommand,
 	cwd: cwdOverride,
 	listed = true,
 	cols: requestedCols,
@@ -3158,7 +3216,7 @@ async function createTerminalSessionUnlocked({
 
 		if (listed) existing.listed = true;
 		if (initialCommand && !existing.readOnly)
-			queueInitialCommand(existing, initialCommand);
+			queueInitialCommand(existing, initialCommand, acknowledgeInitialCommand);
 		return existing;
 	}
 
@@ -3471,6 +3529,7 @@ async function createTerminalSessionUnlocked({
 	};
 	reclaimSession = session;
 	sessions.set(terminalId, session);
+	if (!isAdopted && !session.readOnly) beginTerminalInputProvenance(terminalId);
 	portManager.upsertSession(terminalId, workspaceId, pty.pid);
 
 	if (session.shellReadyState === "pending") {
@@ -3622,7 +3681,7 @@ async function createTerminalSessionUnlocked({
 			: Promise.resolve();
 
 	if (initialCommand) {
-		queueInitialCommand(session, initialCommand);
+		queueInitialCommand(session, initialCommand, acknowledgeInitialCommand);
 	}
 
 	return session;
@@ -3977,7 +4036,11 @@ export function registerWorkspaceTerminalRoute({
 
 					if (message.type === "input") {
 						if (session.readOnly) return;
-						session.pty.write(message.data);
+						writeInputToSession({
+							terminalId: session.terminalId,
+							workspaceId: session.workspaceId,
+							data: message.data,
+						});
 						return;
 					}
 

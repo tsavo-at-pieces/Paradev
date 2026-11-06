@@ -11,6 +11,7 @@ import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import type { HostDb } from "../../../db";
 import * as schema from "../../../db/schema";
 import { TerminalAgentStore } from "../../../terminal-agents";
+import type { HostServiceContext } from "../../../types";
 import { importCloudAttachments } from "../attachments/attachments";
 import {
 	type AttachmentMetadata,
@@ -23,9 +24,11 @@ import {
 	bindResumedSession,
 	buildAgentCommandString,
 	buildTerminalAgentLaunch,
+	canChooseFreshClaudeSession,
 	chatContinuationTarget,
 	chatLaunchTarget,
 	continuationTarget,
+	runAgentInWorkspace,
 	validateAgentEffortSelection,
 	validateAgentForkSelection,
 	validateAgentLaunchOptions,
@@ -64,6 +67,43 @@ const RANDOM_ID = "test-1234";
 const DELIMITER = "SUPERSET_PROMPT_test1234";
 
 describe("buildAgentCommandString", () => {
+	it("chooses a native session only for a fresh stock Claude launch", () => {
+		expect(canChooseFreshClaudeSession(argvConfig, {})).toBe(true);
+		for (const args of [
+			["--resume", "old"],
+			["-c"],
+			["--session-id=old"],
+			["--fork-session"],
+			["--from-pr", "1"],
+			["--teleport", "old"],
+			["--"],
+			["attach", "old"],
+		]) {
+			expect(canChooseFreshClaudeSession({ ...argvConfig, args }, {})).toBe(
+				false,
+			);
+		}
+		expect(
+			canChooseFreshClaudeSession(argvConfig, { resumeSessionId: "old" }),
+		).toBe(false);
+		expect(
+			canChooseFreshClaudeSession(argvConfig, { forkSessionId: "old" }),
+		).toBe(false);
+		expect(
+			canChooseFreshClaudeSession(
+				{ ...argvConfig, command: "custom-wrapper" },
+				{},
+			),
+		).toBe(false);
+		expect(canChooseFreshClaudeSession(stdinConfig, {})).toBe(false);
+		expect(
+			buildAgentCommandString(argvConfig, "hello", [], {
+				nativeSessionId: "10000000-0000-4000-8000-000000000001",
+			}),
+		).toBe(
+			"'claude' '--dangerously-skip-permissions' '--session-id' '10000000-0000-4000-8000-000000000001' 'hello'",
+		);
+	});
 	it("appends the prompt as a quoted positional (argv transport)", () => {
 		// Not the shared "$(cat <<…)" form: the command must parse in non-POSIX
 		// shells like fish, which have no heredocs.
@@ -306,8 +346,43 @@ describe("buildTerminalAgentLaunch", () => {
 		});
 		expect(launch.label).toBe("Claude");
 		expect(launch.fullCommand).toBe(
-			"FOO='bar' 'claude' '--dangerously-skip-permissions' 'do the thing'",
+			"FOO='bar' TEAMROUTER_SUBMISSION_ID='' 'claude' '--dangerously-skip-permissions' 'do the thing'",
 		);
+	});
+
+	it("rejects a preallocated terminal id that already belongs to a session", async () => {
+		const db = createTestDb();
+		seedConfig(db);
+		const workspaceId = "11111111-1111-1111-1111-111111111111";
+		const terminalId = "22222222-2222-2222-2222-222222222222";
+		db.insert(schema.projects)
+			.values({ id: "project", repoPath: "/unused" })
+			.run();
+		db.insert(schema.workspaces)
+			.values({
+				id: workspaceId,
+				projectId: "project",
+				worktreePath: "/unused",
+				branch: "main",
+			})
+			.run();
+		db.insert(schema.terminalSessions)
+			.values({ id: terminalId, originWorkspaceId: workspaceId })
+			.run();
+		await expect(
+			runAgentInWorkspace(
+				{
+					db,
+					terminalAgentStore: new TerminalAgentStore(),
+				} as HostServiceContext,
+				{
+					workspaceId,
+					terminalId,
+					agent: "claude",
+					prompt: "do the thing",
+				},
+			),
+		).rejects.toMatchObject({ code: "CONFLICT" });
 	});
 
 	it("resumes a previous session with an empty prompt", () => {
@@ -320,8 +395,47 @@ describe("buildTerminalAgentLaunch", () => {
 			resumeSessionId: "abc-123",
 		});
 		expect(launch.fullCommand).toBe(
-			"FOO='bar' 'claude' '--dangerously-skip-permissions' '--resume' 'abc-123'",
+			"FOO='bar' TEAMROUTER_SUBMISSION_ID='' 'claude' '--dangerously-skip-permissions' '--resume' 'abc-123'",
 		);
+	});
+
+	it("scopes a validated submission id to the new launch command", () => {
+		const db = createTestDb();
+		seedConfig(db);
+		db.update(schema.hostAgentConfigs)
+			.set({
+				envJson: JSON.stringify({
+					FOO: "bar",
+					TEAMROUTER_SUBMISSION_ID: "stale",
+				}),
+			})
+			.run();
+		const input = {
+			workspaceId: "11111111-1111-1111-1111-111111111111",
+			agent: "claude",
+			prompt: "hello",
+		};
+		const options = { submissionId: "submission-1" };
+		expect(buildTerminalAgentLaunch(db, input, options).fullCommand).toBe(
+			"FOO='bar' TEAMROUTER_SUBMISSION_ID='submission-1' 'claude' '--dangerously-skip-permissions' 'hello'",
+		);
+		expect(buildTerminalAgentLaunch(db, input).fullCommand).toContain(
+			"TEAMROUTER_SUBMISSION_ID=''",
+		);
+		expect(
+			buildTerminalAgentLaunch(
+				db,
+				{ ...input, resumeSessionId: "old" },
+				options,
+			).fullCommand,
+		).toContain("TEAMROUTER_SUBMISSION_ID=''");
+		expect(
+			buildTerminalAgentLaunch(
+				db,
+				{ ...input, forkSessionId: "session-source" },
+				options,
+			).fullCommand,
+		).toContain("TEAMROUTER_SUBMISSION_ID=''");
 	});
 
 	it("forks a previous provider session without changing the source", () => {
@@ -499,7 +613,7 @@ describe("buildTerminalAgentLaunch", () => {
 		});
 
 		expect(launch.fullCommand).toBe(
-			"'omp' '--model' '@plan' '--thinking' 'high' '--plan-yolo' 'do the thing'",
+			"TEAMROUTER_SUBMISSION_ID='' 'omp' '--model' '@plan' '--thinking' 'high' '--plan-yolo' 'do the thing'",
 		);
 	});
 
@@ -594,7 +708,7 @@ describe("buildTerminalAgentLaunch default account env", () => {
 			prompt: "hi",
 		});
 		expect(launch.fullCommand).toBe(
-			`CLAUDE_CONFIG_DIR='${existingDir}' SUPERSET_DEFAULT_CLAUDE_CONFIG_DIR='${existingDir}' 'claude' 'hi'`,
+			`CLAUDE_CONFIG_DIR='${existingDir}' SUPERSET_DEFAULT_CLAUDE_CONFIG_DIR='${existingDir}' TEAMROUTER_SUBMISSION_ID='' 'claude' 'hi'`,
 		);
 	});
 
@@ -611,7 +725,7 @@ describe("buildTerminalAgentLaunch default account env", () => {
 		// twin still carries the host default so the wrapper can re-resolve a
 		// later account switch without overriding the user-pinned value.
 		expect(launch.fullCommand).toBe(
-			`CLAUDE_CONFIG_DIR='/pinned/profile' SUPERSET_DEFAULT_CLAUDE_CONFIG_DIR='${existingDir}' 'claude' 'hi'`,
+			`CLAUDE_CONFIG_DIR='/pinned/profile' SUPERSET_DEFAULT_CLAUDE_CONFIG_DIR='${existingDir}' TEAMROUTER_SUBMISSION_ID='' 'claude' 'hi'`,
 		);
 	});
 
@@ -624,7 +738,9 @@ describe("buildTerminalAgentLaunch default account env", () => {
 			agent: "claude",
 			prompt: "hi",
 		});
-		expect(launch.fullCommand).toBe("'claude' 'hi'");
+		expect(launch.fullCommand).toBe(
+			"TEAMROUTER_SUBMISSION_ID='' 'claude' 'hi'",
+		);
 	});
 
 	it("does not leak provider account env into other presets", () => {
@@ -649,7 +765,7 @@ describe("buildTerminalAgentLaunch default account env", () => {
 			agent: "amp",
 			prompt: "hi",
 		});
-		expect(launch.fullCommand).toBe("'amp' 'hi'");
+		expect(launch.fullCommand).toBe("TEAMROUTER_SUBMISSION_ID='' 'amp' 'hi'");
 	});
 
 	it("clearing the default (null) restores the system login", () => {
@@ -662,7 +778,9 @@ describe("buildTerminalAgentLaunch default account env", () => {
 			agent: "claude",
 			prompt: "hi",
 		});
-		expect(launch.fullCommand).toBe("'claude' 'hi'");
+		expect(launch.fullCommand).toBe(
+			"TEAMROUTER_SUBMISSION_ID='' 'claude' 'hi'",
+		);
 	});
 });
 

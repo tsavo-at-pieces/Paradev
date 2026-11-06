@@ -93,6 +93,8 @@ or the value arrives empty.
 
 ## Launcher-owned runtime values
 
+`TEAMROUTER_SUBMISSION_ID` is nonsecret correlation metadata set only in a new agent launch command after the host validates its optional signed submission assertion. Inherited and per-agent values are stripped. Launches without a new validated ID, including resume and fork, set this one command-scoped value to empty so shell startup cannot reintroduce stale metadata. It is never added to the host process or persistent terminal environment and conveys no actor authority. The catalog launcher consumes and clears it after recording the launch descriptor. It does not belong in `.env` templates, API schemas, deployment secrets, or workflows. Issuer keys and receipt payloads must never enter this environment overlay.
+
 `SUPERSET_HOST_INSTALL_SOURCE` is set by the desktop coordinator (`desktop`) or standalone CLI spawner (`cli`) on the host child process. A checkout may set `dev`; absent/unrecognized values report `unknown`. This is install provenance, not an API deployment setting: do not put it in shared `.env` templates or deployment secrets. The host ignores login-shell values for this key. In-place updates additionally require a standalone entrypoint and a valid install layout.
 
 `SUPERSET_AGENT_LAUNCH_ID` is set by the outer agent wrapper to a process-and-start-time identifier. Hook children inherit it so a new launch in the same terminal cannot inherit the previous login attribution. It is runtime metadata, not a deployment secret or user setting; it does not belong in `.env` templates or deploy workflows.

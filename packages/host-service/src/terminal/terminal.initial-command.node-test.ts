@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { after, before, describe, test } from "node:test";
+import { after, before, describe, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Server } from "@superset/pty-daemon";
 import { createDb, type HostDb } from "../db/index.ts";
@@ -249,6 +249,52 @@ async function waitFor(predicate: () => boolean, ms: number): Promise<void> {
 		await new Promise((r) => setTimeout(r, 25));
 	}
 }
+
+test("initial command completion records only a successful Enter write", async () => {
+	for (const failEnter of [false, true]) {
+		const terminalId = `receipt-${randomUUID()}`;
+		const session = await createTerminalSessionInternal({
+			terminalId,
+			workspaceId,
+			db,
+		});
+		assert.ok(!("error" in session));
+		session.shellReadyState = "ready";
+		session.shellReadyPromise = Promise.resolve();
+		const writes: string[] = [];
+		const write = mock.method(session.pty, "writeOrThrow", (data: string) => {
+			if (failEnter && data === "\r") throw new Error("disconnected");
+			writes.push(data);
+		});
+		mock.timers.enable({ apis: ["setTimeout"] });
+		try {
+			await createTerminalSessionInternal({
+				terminalId,
+				workspaceId,
+				db,
+				initialCommand: "test-command",
+				acknowledgeInitialCommand: true,
+			});
+			assert.deepEqual(writes, ["test-command"]);
+			let settled = false;
+			void session.initialCommandWritten?.then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			assert.equal(settled, false);
+			mock.timers.tick(500);
+			assert.equal(await session.initialCommandWritten, !failEnter);
+			assert.deepEqual(
+				writes,
+				failEnter ? ["test-command"] : ["test-command", "\r"],
+			);
+		} finally {
+			mock.timers.reset();
+			write.mock.restore();
+			await disposeSessionAndWait(terminalId, db);
+		}
+	}
+});
 
 test("external observation reconnects without owning the worker or accepting input", async () => {
 	const terminalId = `external-${randomUUID().slice(0, 8)}`;

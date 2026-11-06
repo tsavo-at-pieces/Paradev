@@ -18,16 +18,21 @@
 //   ELECTRON_RUN_AS_NODE=1 <electron> --import <tsx>/dist/loader.mjs --test <file>
 
 import { strict as assert } from "node:assert";
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Server } from "@superset/pty-daemon";
+import {
+	contentHash,
+	signTranscriptReceipt,
+} from "@superset/shared/transcript-receipts";
 import { createDb, type HostDb } from "../db/index.ts";
 import { projects, workspaces } from "../db/schema.ts";
 import { buildWatchPrompt } from "../page-watch/buildPrompt.ts";
+import { flushSubmissionReceiptsForTests } from "../submission-provenance/index.ts";
 import {
 	markTerminalAgentBindingEnded,
 	SqliteTerminalAgentBindingPersistence,
@@ -48,6 +53,7 @@ import {
 	writeFramedInputToSession,
 	writeInputToSession,
 } from "./terminal.ts";
+import { captureInputEpoch } from "./terminal-input-provenance.ts";
 import { __setAccountShellForTesting } from "./user-shell.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,6 +132,228 @@ function bindAgent(terminalId: string) {
 		occurredAt: Date.now(),
 	});
 }
+
+test("raw and unsigned structured input invalidate provenance before writing bytes", async () => {
+	for (const structured of [false, true]) {
+		const terminalId = `input-epoch-${randomUUID()}`;
+		const session = await createTerminalSessionInternal({
+			terminalId,
+			workspaceId,
+			db,
+		});
+		assert.ok(!("error" in session));
+		assert.notEqual(captureInputEpoch(terminalId), null);
+		const epochsAtWrite: Array<number | null> = [];
+		const write = mock.method(
+			session.pty,
+			structured ? "writeOrThrow" : "write",
+			() => {
+				epochsAtWrite.push(captureInputEpoch(terminalId));
+			},
+		);
+		try {
+			if (structured) {
+				bindAgent(terminalId);
+				assert.deepEqual(
+					await sendAgentMessage({
+						terminalId,
+						workspaceId,
+						db,
+						terminalAgentStore,
+						text: "draft",
+						submit: false,
+					}),
+					{ success: true },
+				);
+			} else {
+				assert.deepEqual(
+					writeInputToSession({ terminalId, workspaceId, data: "raw" }),
+					{ success: true },
+				);
+			}
+			assert.deepEqual(epochsAtWrite, [null]);
+		} finally {
+			write.mock.restore();
+			await disposeSessionAndWait(terminalId, db);
+		}
+	}
+});
+
+test("a stalled receipt completion cannot delay a successful send", async () => {
+	const terminalId = `stalled-receipt-${randomUUID()}`;
+	const session = await createTerminalSessionInternal({
+		terminalId,
+		workspaceId,
+		db,
+	});
+	assert.ok(!("error" in session));
+	bindAgent(terminalId);
+	const pasted = Promise.withResolvers<void>();
+	const receiptStarted = Promise.withResolvers<void>();
+	const receiptFinished = Promise.withResolvers<void>();
+	const write = mock.method(session.pty, "writeOrThrow", () =>
+		pasted.resolve(),
+	);
+	mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		const sending = sendAgentMessage({
+			terminalId,
+			workspaceId,
+			db,
+			terminalAgentStore,
+			text: "hello",
+			submit: true,
+			enterDelayMs: 0,
+			submissionAssertion: {
+				schemaVersion: 1,
+				issuerId: "test",
+				receiptId: "test",
+				signature: `${"A".repeat(86)}==`,
+				payload: {
+					type: "submission",
+					submissionId: "test",
+					provider: "claude",
+					workspaceId,
+					terminalId,
+					contentHash: contentHash("hello"),
+					actor: "owner",
+					origin: "owner_ui",
+					issuedAt: new Date().toISOString(),
+				},
+			},
+			prepareSubmission: async () => ({
+				written: () => {
+					receiptStarted.resolve();
+					return receiptFinished.promise;
+				},
+				failed: async () => {},
+			}),
+		});
+		await pasted.promise;
+		mock.timers.tick(0);
+		await receiptStarted.promise;
+		let completed = false;
+		void sending.then(() => {
+			completed = true;
+		});
+		await new Promise(setImmediate);
+		assert.equal(completed, true);
+		assert.deepEqual(await sending, { success: true });
+	} finally {
+		receiptFinished.resolve();
+		mock.timers.reset();
+		write.mock.restore();
+		await disposeSessionAndWait(terminalId, db);
+	}
+});
+
+test("submission receipts record failed Enter and never cover staged drafts", async () => {
+	const terminalId = `receipt-${randomUUID()}`;
+	const session = await createTerminalSessionInternal({
+		terminalId,
+		workspaceId,
+		db,
+	});
+	assert.ok(!("error" in session));
+	bindAgent(terminalId);
+	const desktopKey = generateKeyPairSync("ed25519");
+	const hostKey = generateKeyPairSync("ed25519");
+	const directory = path.join(TEST_HOME, "submission-provenance");
+	fs.mkdirSync(directory, { mode: 0o700 });
+	const privateKeyPath = path.join(directory, "host.pem");
+	fs.writeFileSync(
+		privateKeyPath,
+		hostKey.privateKey.export({ type: "pkcs8", format: "pem" }),
+		{ mode: 0o600 },
+	);
+	fs.writeFileSync(
+		path.join(directory, "config.json"),
+		JSON.stringify({
+			enabled: true,
+			issuerId: "host-test",
+			privateKeyPath,
+			trustedIssuers: [
+				{
+					id: "desktop-test",
+					publicKey: desktopKey.publicKey.export({
+						type: "spki",
+						format: "pem",
+					}),
+					allowedTypes: ["submission"],
+					allowedActors: ["owner"],
+					allowedOrigins: ["owner_ui"],
+				},
+			],
+		}),
+		{ mode: 0o600 },
+	);
+	const priorDbPath = process.env.HOST_DB_PATH;
+	process.env.HOST_DB_PATH = path.join(TEST_HOME, "host.db");
+	let failEnter = false;
+	const write = mock.method(session.pty, "writeOrThrow", (data: string) => {
+		if (failEnter && data === "\r") throw new Error("disconnected");
+	});
+	const send = (submissionId: string, submit: boolean) =>
+		sendAgentMessage({
+			terminalId,
+			workspaceId,
+			db,
+			terminalAgentStore,
+			text: "hello",
+			submit,
+			enterDelayMs: 0,
+			submissionAssertion: signTranscriptReceipt(
+				{
+					schemaVersion: 1,
+					issuerId: "desktop-test",
+					receiptId: randomUUID(),
+					payload: {
+						type: "submission",
+						submissionId,
+						provider: "claude",
+						workspaceId,
+						terminalId,
+						contentHash: contentHash("hello"),
+						actor: "owner",
+						origin: "owner_ui",
+						issuedAt: new Date().toISOString(),
+					},
+				},
+				desktopKey.privateKey,
+			),
+		});
+	try {
+		assert.deepEqual(await send("draft", false), { success: true });
+		const pendingPath = path.join(directory, "pending.jsonl");
+		assert.equal(fs.existsSync(pendingPath), false);
+		failEnter = true;
+		assert.ok("error" in (await send("failed", true)));
+		await flushSubmissionReceiptsForTests();
+		failEnter = false;
+		assert.deepEqual(await send("written", true), { success: true });
+		await flushSubmissionReceiptsForTests();
+		const states = fs
+			.readFileSync(pendingPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => {
+				const entry = JSON.parse(line);
+				return [entry.assertion.payload.submissionId, entry.state];
+			});
+		assert.deepEqual(states, [
+			["failed", "prepared"],
+			["failed", "failed"],
+			["written", "prepared"],
+			["written", "written"],
+		]);
+		assert.equal(fs.existsSync(path.join(directory, "inbox.jsonl")), false);
+	} finally {
+		write.mock.restore();
+		if (priorDbPath === undefined) delete process.env.HOST_DB_PATH;
+		else process.env.HOST_DB_PATH = priorDbPath;
+		await disposeSessionAndWait(terminalId, db);
+	}
+});
 
 before(async () => {
 	fs.mkdirSync(TEST_HOME, { recursive: true });

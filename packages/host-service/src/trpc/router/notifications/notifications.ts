@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { terminalSessions } from "../../../db/schema";
 import { mapEventType } from "../../../events";
+import { observePendingSubmissions } from "../../../submission-provenance/index";
 import { verifyAttributionToken } from "../../../terminal-agents/attribution-token";
 import { recordTerminalAgentTranscriptPath } from "../../../terminal-agents/persistence";
 import { isTrustedTranscriptPath } from "../../../terminal-agents/transcript-path";
@@ -240,6 +241,21 @@ export const notificationsRouter = router({
 			recordTerminalAgentTranscriptPath(ctx.db, {
 				terminalId: input.terminalId,
 				agentSessionId: agent.sessionId,
+				transcriptPath,
+			});
+		}
+
+		if (
+			agent?.sessionId &&
+			transcriptPath &&
+			isTrustedTranscriptPath(transcriptPath) &&
+			verifyAttributionToken(input.terminalId, input.attributionToken)
+		) {
+			void observePendingSubmissions({
+				workspaceId: terminalSession.originWorkspaceId,
+				terminalId: input.terminalId,
+				provider: agent.agentId,
+				nativeSessionId: agent.sessionId,
 				transcriptPath,
 			});
 		}

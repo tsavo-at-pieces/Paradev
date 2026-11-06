@@ -24,6 +24,10 @@ import {
 	type TerminalColors,
 	terminalColorsSchema,
 } from "@superset/shared/terminal-colors";
+import {
+	type SubmissionAssertion,
+	submissionAssertionSchema,
+} from "@superset/shared/transcript-receipts";
 import { TRPCError } from "@trpc/server";
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
@@ -34,11 +38,14 @@ import {
 	terminalSessions,
 	workspaces,
 } from "../../../db/schema";
+import { prepareSubmissionDelivery } from "../../../submission-provenance/index";
 import {
 	createTerminalSessionInternal,
+	getPendingTerminalWorkspaceId,
 	isExternalTerminal,
 	sendAgentMessage,
 } from "../../../terminal/terminal";
+import { invalidateInputProvenance } from "../../../terminal/terminal-input-provenance";
 import type {
 	TerminalAgentBinding,
 	TerminalAgentStore,
@@ -81,6 +88,7 @@ export function buildAgentCommandString(
 	options: {
 		resumeSessionId?: string;
 		forkSessionId?: string;
+		nativeSessionId?: string;
 		randomId?: string;
 	} = {},
 ): string {
@@ -96,6 +104,9 @@ export function buildAgentCommandString(
 		config.command,
 		...config.args,
 		...modelArgs,
+		...(options.nativeSessionId
+			? ["--session-id", options.nativeSessionId]
+			: []),
 		...resumeArgv,
 		...forkArgv,
 	];
@@ -141,6 +152,8 @@ function buildAttachmentBlock(
 }
 
 export interface AgentRunInput {
+	terminalId?: string;
+	submissionAssertion?: SubmissionAssertion;
 	colors?: TerminalColors;
 	workspaceId: string;
 	agent: string;
@@ -405,7 +418,13 @@ export function validateAgentLaunchOptions(
 export function buildTerminalAgentLaunch(
 	db: HostDb,
 	input: AgentRunInput,
-): { fullCommand: string; label: string } {
+	options: { nativeSessionId?: string; submissionId?: string } = {},
+): {
+	fullCommand: string;
+	label: string;
+	writtenPrompt: string;
+	provider: string;
+} {
 	const config = resolveHostAgentConfig(db, input.agent);
 	if (!config) {
 		// Worded for end users (automation run errors show this verbatim), but
@@ -474,12 +493,24 @@ export function buildTerminalAgentLaunch(
 		{
 			resumeSessionId: input.resumeSessionId,
 			forkSessionId: input.forkSessionId,
+			nativeSessionId: options.nativeSessionId,
 		},
 	);
 	const modelEnv = buildAgentModelEnv(launchPresetId, input.model);
+	const submissionEnv: Record<string, string> =
+		options.submissionId &&
+		!input.resumeSessionId &&
+		!input.forkSessionId &&
+		Buffer.from(options.submissionId).toString() === options.submissionId
+			? { TEAMROUTER_SUBMISSION_ID: options.submissionId }
+			: { TEAMROUTER_SUBMISSION_ID: "" };
+	const launchEnv = agentLaunchEnv(db, config);
+	delete launchEnv.TEAMROUTER_SUBMISSION_ID;
 	return {
-		fullCommand: `${envOverlayPrefix({ ...agentLaunchEnv(db, config), ...modelEnv })}${command}`,
+		fullCommand: `${envOverlayPrefix({ ...launchEnv, ...modelEnv, ...submissionEnv })}${command}`,
 		label: config.label,
+		writtenPrompt: sanitizePromptForPty(prompt),
+		provider: launchIdentity(config),
 	};
 }
 
@@ -512,33 +543,117 @@ export function bindResumedSession(
 	});
 }
 
+export function canChooseFreshClaudeSession(
+	config: ResolvedHostAgentConfig | null,
+	input: Pick<AgentRunInput, "resumeSessionId" | "forkSessionId">,
+): boolean {
+	if (
+		!config ||
+		config.presetId !== "claude" ||
+		!/(?:^|\/)claude$/.test(config.command) ||
+		input.resumeSessionId ||
+		input.forkSessionId
+	)
+		return false;
+	return (
+		config.promptTransport === "argv" &&
+		config.promptArgs.length === 0 &&
+		config.args.every(
+			(arg) =>
+				arg === "--dangerously-skip-permissions" ||
+				arg === "--allow-dangerously-skip-permissions",
+		)
+	);
+}
+
+const claimedLaunchTerminals = new Set<string>();
+
 async function runTerminalAgent(
 	ctx: Pick<HostServiceContext, "db" | "eventBus" | "terminalAgentStore">,
 	input: AgentRunInput,
 ): Promise<AgentRunResult> {
-	const { fullCommand, label } = buildTerminalAgentLaunch(ctx.db, input);
+	const { fullCommand, label, writtenPrompt, provider } =
+		buildTerminalAgentLaunch(ctx.db, input);
 
-	const terminalId = crypto.randomUUID();
-	const result = await createTerminalSessionInternal({
-		terminalId,
-		workspaceId: input.workspaceId,
-		db: ctx.db,
-		eventBus: ctx.eventBus,
-		initialCommand: fullCommand,
-		colors: input.colors,
-	});
-
-	if ("error" in result) {
-		throw toTerminalSessionError(result);
+	const terminalId = input.terminalId ?? crypto.randomUUID();
+	if (
+		input.terminalId &&
+		(ctx.db.query.terminalSessions
+			.findFirst({ where: eq(terminalSessions.id, terminalId) })
+			.sync() ||
+			getPendingTerminalWorkspaceId(terminalId) ||
+			claimedLaunchTerminals.has(terminalId))
+	) {
+		throw new TRPCError({
+			code: "CONFLICT",
+			message: "Terminal id is already in use",
+		});
 	}
+	claimedLaunchTerminals.add(terminalId);
+	try {
+		const freshNativeSessionId =
+			input.submissionAssertion &&
+			canChooseFreshClaudeSession(
+				resolveHostAgentConfig(ctx.db, input.agent),
+				input,
+			)
+				? crypto.randomUUID()
+				: undefined;
+		const preparedCommand = input.submissionAssertion
+			? buildTerminalAgentLaunch(ctx.db, input, {
+					nativeSessionId: freshNativeSessionId,
+					submissionId: input.submissionAssertion.payload.submissionId,
+				}).fullCommand
+			: fullCommand;
+		const delivery =
+			input.submissionAssertion && writtenPrompt.length > 0
+				? await prepareSubmissionDelivery({
+						kind: "initial",
+						freshNativeSession: Boolean(freshNativeSessionId),
+						assertion: input.submissionAssertion,
+						workspaceId: input.workspaceId,
+						terminalId,
+						prompt: writtenPrompt,
+						provider,
+						nativeSessionId: freshNativeSessionId ?? input.resumeSessionId,
+					}).catch(() => null)
+				: null;
+		const command = delivery ? preparedCommand : fullCommand;
+		const result = await createTerminalSessionInternal({
+			terminalId,
+			workspaceId: input.workspaceId,
+			db: ctx.db,
+			eventBus: ctx.eventBus,
+			initialCommand: command,
+			acknowledgeInitialCommand: Boolean(delivery),
+			colors: input.colors,
+		});
 
-	bindResumedSession(ctx, input, result.terminalId);
+		if ("error" in result) {
+			void delivery?.failed?.().catch(() => {});
+			throw toTerminalSessionError(result);
+		}
 
-	return {
-		kind: "terminal",
-		sessionId: result.terminalId,
-		label,
-	};
+		bindResumedSession(ctx, input, result.terminalId);
+		if (delivery) {
+			void result.initialCommandWritten
+				?.catch(() => false)
+				.then((written) => {
+					if (written) return delivery.written();
+					invalidateInputProvenance(terminalId);
+					return delivery.failed?.();
+				})
+				.catch(() => {});
+		}
+
+		return {
+			kind: "terminal",
+			sessionId: result.terminalId,
+			label,
+		};
+	} finally {
+		claimedLaunchTerminals.delete(terminalId);
+	}
 }
 
 /**
@@ -785,6 +900,7 @@ async function continueTerminalAgent(
 		terminalId: target.terminalId,
 		workspaceId: input.workspaceId,
 		text: input.prompt,
+		submissionAssertion: input.submissionAssertion,
 		terminalAgentStore: ctx.terminalAgentStore,
 		submit: true,
 		db: ctx.db,
@@ -888,11 +1004,15 @@ export const agentsRouter = router({
 		.input(
 			z.object({
 				workspaceId: z.string().uuid(),
+				terminalId: z.string().uuid().optional(),
 				colors: terminalColorsSchema.optional(),
 				agent: z.string().min(1),
 				// Optional: an empty prompt launches the bare agent (the builder
 				// drops promptArgs).
 				prompt: z.string().default(""),
+				submissionAssertion: submissionAssertionSchema
+					.optional()
+					.catch(undefined),
 				attachmentIds: z.array(z.string().uuid()).optional(),
 				model: z.string().min(1).optional(),
 				effort: z.string().min(1).optional(),

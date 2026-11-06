@@ -516,6 +516,18 @@
 		"./automation-group": {
 			"types": "./src/automation-group.ts",
 			"default": "./src/automation-group.ts"
+		},
+		"./transcript-receipts": {
+			"types": "./src/transcript-receipts.ts",
+			"default": "./src/transcript-receipts.ts"
+		},
+		"./private-jsonl": {
+			"types": "./src/private-jsonl.ts",
+			"default": "./src/private-jsonl.ts"
+		},
+		"./receipt-deadline": {
+			"types": "./src/receipt-deadline.ts",
+			"default": "./src/receipt-deadline.ts"
 		}
 	},
 	"scripts": {

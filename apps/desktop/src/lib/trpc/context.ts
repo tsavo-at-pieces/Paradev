@@ -1,4 +1,8 @@
-import { BrowserWindow, type IpcMainInvokeEvent } from "electron";
+import {
+	BrowserWindow,
+	type IpcMainInvokeEvent,
+	type WebContents,
+} from "electron";
 
 /**
  * Per-call tRPC context for Electron IPC.
@@ -13,19 +17,21 @@ import { BrowserWindow, type IpcMainInvokeEvent } from "electron";
  */
 export interface TrpcContext {
 	senderWindow: BrowserWindow | null;
+	senderIsMainFrame?: boolean;
 }
 
-export async function createTrpcContext({
-	event,
-}: {
-	event: IpcMainInvokeEvent;
-}): Promise<TrpcContext> {
+export async function createTrpcContext(
+	{ event }: { event: IpcMainInvokeEvent },
+	findWindow: (sender: WebContents) => BrowserWindow | null = (sender) =>
+		BrowserWindow.fromWebContents(sender),
+): Promise<TrpcContext> {
 	// Only treat the sender as a window when it is that window's own top-level
 	// WebContents. `BrowserWindow.fromWebContents` returns the *host* window for a
 	// `<webview>` guest, so without this check an embedded webview could inherit
 	// the host window's organization on window-scoped procedures.
-	const window = BrowserWindow.fromWebContents(event.sender);
+	const window = findWindow(event.sender);
 	return {
 		senderWindow: window?.webContents === event.sender ? window : null,
+		senderIsMainFrame: event.senderFrame === event.sender.mainFrame,
 	};
 }

@@ -1,6 +1,7 @@
 import { TERMINAL_HANDOFF_MAX_CHARS } from "@superset/shared/session-handoff";
 import { terminalColorsSchema } from "@superset/shared/terminal-colors";
 import { normalizeTerminalTitle } from "@superset/shared/terminal-title-scanner";
+import { submissionAssertionSchema } from "@superset/shared/transcript-receipts";
 import { TRPCError } from "@trpc/server";
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
@@ -284,6 +285,9 @@ export const terminalRouter = router({
 					workspaceId: z.string(),
 					text: z.string(),
 					submit: z.boolean().default(true),
+					submissionAssertion: submissionAssertionSchema
+						.optional()
+						.catch(undefined),
 				})
 				.refine((input) => input.submit || input.text.length > 0, {
 					message: "Nothing to send",

@@ -12,6 +12,7 @@ import {
 	useV2AgentConfigs,
 	v2AgentConfigsQueryOptions,
 } from "renderer/hooks/useV2AgentConfigs";
+import { electronTrpc } from "renderer/lib/electron-trpc";
 import { terminalQueryColors } from "renderer/lib/terminal/terminal-query-colors";
 import type { StoreApi } from "zustand/vanilla";
 import type {
@@ -62,6 +63,8 @@ export function useAgentSessionLauncher({
 } {
 	const { t } = useLingui();
 	const { mutateAsync: runAgent } = workspaceTrpc.agents.run.useMutation();
+	const { mutateAsync: runWithReceipt } =
+		electronTrpc.submissionProvenance.run.useMutation();
 	const appearance = useTerminalAppearance();
 	const resolveAcpChatEnabled = useResolveAcpChatEnabled();
 	const { hostUrl } = useWorkspaceClient();
@@ -135,7 +138,7 @@ export function useAgentSessionLauncher({
 				// Host pipeline bakes the prompt into the initialCommand using the
 				// agent's argv/stdin transport — no follow-up writeInput needed,
 				// no bind-wait race vs. the launching shell.
-				const result = await runAgent({
+				const launch = {
 					workspaceId,
 					colors: terminalQueryColors(appearance.theme),
 					agent: input.configId,
@@ -152,7 +155,11 @@ export function useAgentSessionLauncher({
 					...(input.forkSessionId
 						? { forkSessionId: input.forkSessionId }
 						: {}),
-				});
+				};
+				const submission = await runWithReceipt({ hostUrl, ...launch });
+				const result = submission.handled
+					? submission.result
+					: await runAgent(launch);
 				if (result.kind !== "terminal") {
 					toast.error(
 						t({
@@ -200,7 +207,16 @@ export function useAgentSessionLauncher({
 				return null;
 			}
 		},
-		[runAgent, store, workspaceId, t, appearance.theme, openAgentChat],
+		[
+			runAgent,
+			runWithReceipt,
+			hostUrl,
+			store,
+			workspaceId,
+			t,
+			appearance.theme,
+			openAgentChat,
+		],
 	);
 
 	const focusAgentTerminal = useCallback(
